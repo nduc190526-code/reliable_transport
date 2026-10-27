@@ -4,130 +4,121 @@ import sys
 import time
 from utils import PacketHeader, compute_checksum
 
-PKT_TYPE_START = 0
-PKT_TYPE_END = 1
-PKT_TYPE_DATA = 2
-PKT_TYPE_ACK = 3
+TYPE_START = 0
+TYPE_END = 1
+TYPE_DATA = 2
+TYPE_ACK = 3
 
-HDR_BYTES = 16
-MTU_LIMIT = 1472
-PAYLOAD_CAPACITY = MTU_LIMIT - HDR_BYTES
-RETRANSMIT_TIMEOUT = 0.5
+HDR_SIZE = 16
+MAX_SIZE = 1472
+PAYLOAD_SIZE = MAX_SIZE - HDR_SIZE
+TIMEOUT_VAL = 0.5
 
-class RTPSenderChannel:
-    def __init__(self, target_host, target_port, win_limit):
-        if win_limit < 1:
-            raise ValueError("window_size must be at least 1")
-        self.endpoint = (target_host, target_port)
-        self.win_limit = win_limit
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_sock.settimeout(RETRANSMIT_TIMEOUT)
+def build_packet(p_type, seq_num, body=b""):
+    hdr = PacketHeader(type=p_type, seq_num=seq_num, length=len(body), checksum=0)
+    hdr.checksum = compute_checksum(hdr / body)
+    return bytes(hdr / body)
 
-    def create_frame(self, p_type, sequence, payload=b""):
-        hdr = PacketHeader(type=p_type, seq_num=sequence, length=len(payload), checksum=0)
-        hdr.checksum = compute_checksum(hdr / payload)
-        return bytes(hdr / payload)
-
-    def verify_and_unpack(self, datagram):
-        if len(datagram) < HDR_BYTES:
+def parse_packet(buf):
+    if len(buf) < HDR_SIZE:
+        return None
+    try:
+        hdr = PacketHeader(buf[:HDR_SIZE])
+        payload = buf[HDR_SIZE:HDR_SIZE + hdr.length]
+        if len(payload) != hdr.length:
             return None
-        try:
-            p_hdr = PacketHeader(datagram[:HDR_BYTES])
-            content = datagram[HDR_BYTES:HDR_BYTES + p_hdr.length]
-            if len(content) != p_hdr.length:
-                return None
-            csum_origin = p_hdr.checksum
-            p_hdr.checksum = 0
-            if compute_checksum(p_hdr / content) != csum_origin:
-                return None
-            return p_hdr
-        except Exception:
+        csum = hdr.checksum
+        hdr.checksum = 0
+        if compute_checksum(hdr / payload) != csum:
             return None
+        return hdr
+    except:
+        return None
 
-    def establish_handshake(self):
-        init_pkt = self.create_frame(PKT_TYPE_START, 0)
-        self.udp_sock.sendto(init_pkt, self.endpoint)
+def sender(dest_ip, dest_port, win_sz):
+    if win_sz < 1:
+        raise ValueError("Window size invalid")
+
+    target = (dest_ip, dest_port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(TIMEOUT_VAL)
+
+    try:
+        data_in = sys.stdin.buffer.read()
+        pkt_init = build_packet(TYPE_START, 0)
+        sock.sendto(pkt_init, target)
+
         while True:
             try:
-                raw_in, _ = self.udp_sock.recvfrom(MTU_LIMIT)
+                r_buf, _ = sock.recvfrom(MAX_SIZE)
             except socket.timeout:
-                self.udp_sock.sendto(init_pkt, self.endpoint)
+                sock.sendto(pkt_init, target)
                 continue
-            parsed = self.verify_and_unpack(raw_in)
-            if parsed and parsed.type == PKT_TYPE_ACK and parsed.seq_num == 1:
+            res = parse_packet(r_buf)
+            if res and res.type == TYPE_ACK and res.seq_num == 1:
                 break
 
-    def transmit_payload(self, stream_data):
-        segments = [stream_data[pos:pos + PAYLOAD_CAPACITY] for pos in range(0, len(stream_data), PAYLOAD_CAPACITY)]
-        pkt_store = {idx + 1: self.create_frame(PKT_TYPE_DATA, idx + 1, seg) for idx, seg in enumerate(segments)}
-        
-        base_seq = 1
-        curr_seq = 1
-        total_segs = len(segments)
-        clock_start = None
+        chunks = [data_in[i:i + PAYLOAD_SIZE] for i in range(0, len(data_in), PAYLOAD_SIZE)]
+        pkts = {i + 1: build_packet(TYPE_DATA, i + 1, chunks[i]) for i in range(len(chunks))}
 
-        while base_seq <= total_segs:
-            while curr_seq <= total_segs and curr_seq < base_seq + self.win_limit:
-                self.udp_sock.sendto(pkt_store[curr_seq], self.endpoint)
-                if clock_start is None:
-                    clock_start = time.monotonic()
-                curr_seq += 1
+        base = 1
+        curr = 1
+        total = len(chunks)
+        t_start = None
 
-            wait_time = (RETRANSMIT_TIMEOUT - (time.monotonic() - clock_start)) if clock_start is not None else RETRANSMIT_TIMEOUT
-            self.udp_sock.settimeout(max(wait_time, 0.001))
+        while base <= total:
+            while curr <= total and curr < base + win_sz:
+                sock.sendto(pkts[curr], target)
+                if t_start is None:
+                    t_start = time.monotonic()
+                curr += 1
+
+            t_left = (TIMEOUT_VAL - (time.monotonic() - t_start)) if t_start else TIMEOUT_VAL
+            sock.settimeout(max(t_left, 0.001))
 
             try:
-                raw_in, _ = self.udp_sock.recvfrom(MTU_LIMIT)
+                r_buf, _ = sock.recvfrom(MAX_SIZE)
             except socket.timeout:
-                for s_num in range(base_seq, curr_seq):
-                    self.udp_sock.sendto(pkt_store[s_num], self.endpoint)
-                clock_start = time.monotonic()
+                for s in range(base, curr):
+                    sock.sendto(pkts[s], target)
+                t_start = time.monotonic()
                 continue
 
-            ack_hdr = self.verify_and_unpack(raw_in)
-            if not ack_hdr or ack_hdr.type != PKT_TYPE_ACK:
+            res = parse_packet(r_buf)
+            if not res or res.type != TYPE_ACK:
                 continue
 
-            ack_val = ack_hdr.seq_num
-            if base_seq < ack_val <= curr_seq:
-                base_seq = ack_val
-                clock_start = None if base_seq == curr_seq else time.monotonic()
+            ack_id = res.seq_num
+            if base < ack_id <= curr:
+                base = ack_id
+                t_start = None if base == curr else time.monotonic()
 
-        self.teardown_connection(total_segs + 1)
+        fin_seq = total + 1
+        fin_pkt = build_packet(TYPE_END, fin_seq)
+        ack_needed = fin_seq + 1
+        sock.sendto(fin_pkt, target)
+        deadline = time.monotonic() + TIMEOUT_VAL
 
-    def teardown_connection(self, fin_seq):
-        term_pkt = self.create_frame(PKT_TYPE_END, fin_seq)
-        expected_ack_num = fin_seq + 1
-        self.udp_sock.sendto(term_pkt, self.endpoint)
-        expire_time = time.monotonic() + RETRANSMIT_TIMEOUT
-
-        while time.monotonic() < expire_time:
-            self.udp_sock.settimeout(max(expire_time - time.monotonic(), 0.001))
+        while time.monotonic() < deadline:
+            sock.settimeout(max(deadline - time.monotonic(), 0.001))
             try:
-                raw_in, _ = self.udp_sock.recvfrom(MTU_LIMIT)
+                r_buf, _ = sock.recvfrom(MAX_SIZE)
             except socket.timeout:
                 break
-            ack_hdr = self.verify_and_unpack(raw_in)
-            if ack_hdr and ack_hdr.type == PKT_TYPE_ACK and ack_hdr.seq_num == expected_ack_num:
+            res = parse_packet(r_buf)
+            if res and res.type == TYPE_ACK and res.seq_num == ack_needed:
                 break
 
-    def close(self):
-        self.udp_sock.close()
+    finally:
+        sock.close()
 
 def main():
-    cli_parser = argparse.ArgumentParser()
-    cli_parser.add_argument("receiver_ip", help="Target receiver IP")
-    cli_parser.add_argument("receiver_port", type=int, help="Target receiver port")
-    cli_parser.add_argument("window_size", type=int, help="Sliding window size")
-    args = cli_parser.parse_args()
-
-    sender_inst = RTPSenderChannel(args.receiver_ip, args.receiver_port, args.window_size)
-    try:
-        raw_msg = sys.stdin.buffer.read()
-        sender_inst.establish_handshake()
-        sender_inst.transmit_payload(raw_msg)
-    finally:
-        sender_inst.close()
+    p = argparse.ArgumentParser()
+    p.add_argument("receiver_ip", help="")
+    p.add_argument("receiver_port", type=int, help="")
+    p.add_argument("window_size", type=int, help="")
+    args = p.parse_args()
+    sender(args.receiver_ip, args.receiver_port, args.window_size)
 
 if __name__ == "__main__":
     main()
